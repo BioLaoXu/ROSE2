@@ -1,414 +1,253 @@
 #!/usr/bin/env python3
-"""
-Standalone drop-in replacement for ROSE_bamToGFF.py
-Powered by pysam (htslib) + multiprocessing + atomic file writes.
-Zero dependency on ROSE_utils or rose2 package.
-"""
+#bamToGFF.py
 
-import argparse
-import logging
-import os
+#script to grab reads from a bam that align to a .gff file
 import sys
-from concurrent.futures import ProcessPoolExecutor
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import re
 
-import pysam
-
-logger = logging.getLogger("fast_ROSE_bamToGFF")
+import ROSE_utils
 
 
-def _parse_gff(gff_path: str) -> List[List[str]]:
-    rows: List[List[str]] = []
-    with open(gff_path, "r") as fh:
-        for line in fh:
-            line = line.rstrip("\r\n")
-            if not line or line.startswith("#"):
-                continue
-            cols = line.split("\t")
-            if len(cols) >= 7:
-                rows.append(cols[:9])
-    return rows
+from collections import defaultdict
+
+import os
+
+import string
 
 
-def _resolve_bam_chrom(orig_chrom: str, ref_lengths: Dict[str, int]) -> Optional[str]:
-    """Match GFF chromosome name against BAM header safely (handles chr / non-chr / custom contigs)."""
-    if orig_chrom in ref_lengths:
-        return orig_chrom
-    if orig_chrom.startswith("chr"):
-        alt = orig_chrom[3:]
-        if alt in ref_lengths:
-            return alt
+
+#=====================================================================
+#====================MAPPING BAM READS TO GFF REGIONS=================
+#=====================================================================
+
+
+def mapBamToGFF(bamFile,gff,sense = 'both',extension = 200,floor = 0,rpm = False,matrix = None):
+
+#def mapBamToGFF(bamFile,gff,sense = 'both',unique = 0,extension = 200,floor = 0,density = False,rpm = False,binSize = 25,clusterGram = None,matrix = None,raw = False,includeJxnReads = False):
+    '''maps reads from a bam to a gff'''
+    floor = int(floor)
+    
+    #USING BAM CLASS
+    bam = ROSE_utils.Bam(bamFile)
+
+
+    #new GFF to write to
+    newGFF = []
+    #millionMappedReads
+
+
+    if rpm:    
+        MMR= round(float(bam.getTotalReads('mapped'))/1000000,4)
     else:
-        alt = "chr" + orig_chrom
-        if alt in ref_lengths:
-            return alt
-    return None
+        MMR = 1
 
+    print(('using a MMR value of %s' % (MMR)))
+    
+    #senseTrans = maketrans('-+.','+-+') #deprecated
 
-def _compute_bins_floor0(
-    bam: pysam.AlignmentFile,
-    chrom: str,
-    chrom_len: int,
-    gff_start: int,
-    gff_end: int,
-    gff_strand: str,
-    sense: str,
-    extension: int,
-    n_bins: int,
-    bin_size: float,
-    mmr: float,
-) -> List[float]:
-    if sense in ("both", "."):
-        want_reverse: Optional[bool] = None
+    if ROSE_utils.checkChrStatus(bamFile) == 1:
+      print("has chr")
+      hasChrFlag = 1
+      #sys.exit();
     else:
-        gff_is_fwd = gff_strand in ("+", ".")
-        want_reverse = (not gff_is_fwd) if sense == "+" else gff_is_fwd
+      print("does not have chr")
+      hasChrFlag = 0
+      #sys.exit()
+      
+    if type(gff) == str:
+        gff = ROSE_utils.parseTable(gff,'\t')
+        
+    #setting up a maxtrix table
 
-    search_start = max(0, gff_start - extension - 1)
-    search_end = min(chrom_len, gff_end + extension)
-    if search_start >= search_end:
-        return [0.0] * n_bins
+    newGFF.append(['GENE_ID','locusLine'] + ['bin_'+str(n)+'_'+bamFile.split('/')[-1] for n in range(1,int(matrix)+1,1)])        
 
-    if n_bins == 1:
-        total_cov = 0
-        for read in bam.fetch(chrom, search_start, search_end):
-            if read.is_unmapped:
-                continue
-            is_rev = read.is_reverse
-            if want_reverse is not None and is_rev != want_reverse:
-                continue
-
-            r_start = read.reference_start + 1
-            r_end = read.reference_end
-            if r_end is None:
-                continue
-
-            if is_rev:
-                r_start -= extension
-            else:
-                r_end += extension
-
-            ov_s = r_start if r_start > gff_start else gff_start
-            ov_e = r_end if r_end < gff_end else gff_end
-            if ov_s <= ov_e:
-                total_cov += ov_e - ov_s + 1
-
-        return [round((total_cov / bin_size) / mmr, 4)]
-
-    bin_bounds: List[Tuple[int, int]] = []
-    if gff_strand in ("+", ".", "both"):
-        cur = float(gff_start)
-        for _ in range(n_bins):
-            nxt = cur + bin_size
-            bin_bounds.append((int(cur), int(nxt)))
-            cur = nxt
-        reverse_bins = False
-    else:
-        cur = float(gff_end)
-        for _ in range(n_bins):
-            prv = cur - bin_size
-            bin_bounds.append((int(prv), int(cur)))
-            cur = prv
-        bin_bounds.reverse()
-        reverse_bins = True
-
-    bin_covs = [0] * n_bins
-    inv_bin_size = 1.0 / bin_size
-
-    for read in bam.fetch(chrom, search_start, search_end):
-        if read.is_unmapped:
-            continue
-        is_rev = read.is_reverse
-        if want_reverse is not None and is_rev != want_reverse:
-            continue
-
-        r_start = read.reference_start + 1
-        r_end = read.reference_end
-        if r_end is None:
-            continue
-
-        if is_rev:
-            r_start -= extension
+    #getting and processing reads for gff lines
+    ticker = 0
+    print('Number lines processed')
+    for line in gff:
+        line = line[0:9]
+        if ticker%100 == 0:
+            print(ticker)
+        ticker+=1
+        if not hasChrFlag:
+            line[0] = re.sub(r"chr",r"",line[0])
+        gffLocus = ROSE_utils.Locus(line[0],int(line[3]),int(line[4]),line[6],line[1])
+        #print line[0]
+        #sys.exit()
+        searchLocus = ROSE_utils.makeSearchLocus(gffLocus,int(extension),int(extension))
+        
+        reads = bam.getReadsLocus(searchLocus,'both',False,'none')
+        #now extend the reads and make a list of extended reads
+        extendedReads = []
+        for locus in reads:
+            if locus.sense() == '+' or locus.sense() == '.':
+                locus = ROSE_utils.Locus(locus.chr(),locus.start(),locus.end()+extension,locus.sense(), locus.ID())
+            if locus.sense() == '-':
+                locus = ROSE_utils.Locus(locus.chr(),locus.start()-extension,locus.end(),locus.sense(),locus.ID())
+            extendedReads.append(locus)
+        if gffLocus.sense() == '+' or gffLocus.sense == '.':
+            senseReads = [x for x in extendedReads if x.sense() == '+' or x.sense() == '.']
+            antiReads = [x for x in extendedReads if x.sense() == '-']
         else:
-            r_end += extension
+            senseReads = [x for x in extendedReads if x.sense() == '-' or x.sense() == '.']
+            antiReads = [x for x in extendedReads if x.sense() == '+']
 
-        ov_s = r_start if r_start > gff_start else gff_start
-        ov_e = r_end if r_end < gff_end else gff_end
-        if ov_s > ov_e:
+        senseHash = defaultdict(int)
+        antiHash = defaultdict(int)
+
+        #filling in the readHashes             
+        if sense == '+' or sense == 'both' or sense =='.':
+            for read in senseReads:
+                for x in range(read.start(),read.end()+1,1):
+                    senseHash[x]+=1
+        if sense == '-' or sense == 'both' or sense == '.':
+            #print('foo')
+            for read in antiReads:
+                for x in range(read.start(),read.end()+1,1):
+                    antiHash[x]+=1
+
+        #now apply flooring and filtering for coordinates
+        keys = ROSE_utils.uniquify(list(senseHash.keys())+list(antiHash.keys()))
+        if floor > 0:
+
+            keys = [x for x in keys if (senseHash[x]+antiHash[x]) > floor]
+        #coordinate filtering
+        keys = [x for x in keys if gffLocus.start() < x < gffLocus.end()]
+
+
+        #setting up the output table
+        #clusterLine = [gffLocus.ID(),gffLocus.__str__()]
+
+        # bug fix gff coordinates with same chromosomal name as BAM
+        if not hasChrFlag:
+            clusterLine = [gffLocus.ID(),"chr" + gffLocus.__str__()]
+        else: 
+           clusterLine = [gffLocus.ID(),gffLocus.__str__()]
+
+        #getting the binsize
+        binSize = (gffLocus.len()-1)/int(matrix)
+        nBins = int(matrix)
+        if binSize == 0:
+            clusterLine+=['NA']*int(matrix)
+            newGFF.append(clusterLine)
             continue
+        n=0
+        if gffLocus.sense() == '+' or gffLocus.sense() =='.' or gffLocus.sense() == 'both':
+            i = gffLocus.start()
 
-        b0 = max(0, int((ov_s - gff_start) * inv_bin_size) - 1)
-        b1 = min(n_bins - 1, int((ov_e - gff_start) * inv_bin_size) + 1)
-        for b in range(b0, b1 + 1):
-            bs, be = bin_bounds[b]
-            s = ov_s if ov_s > bs else bs
-            e = ov_e if ov_e < be else be
-            if s <= e:
-                bin_covs[b] += e - s + 1
-
-    if reverse_bins:
-        bin_covs.reverse()
-
-    denom = bin_size * mmr
-    return [round(cov / denom, 4) for cov in bin_covs]
-
-
-def _compute_bins_with_floor(
-    bam: pysam.AlignmentFile,
-    chrom: str,
-    chrom_len: int,
-    gff_start: int,
-    gff_end: int,
-    gff_strand: str,
-    sense: str,
-    extension: int,
-    floor: int,
-    n_bins: int,
-    bin_size: float,
-    mmr: float,
-) -> List[float]:
-    if sense in ("both", "."):
-        want_reverse: Optional[bool] = None
-    else:
-        gff_is_fwd = gff_strand in ("+", ".")
-        want_reverse = (not gff_is_fwd) if sense == "+" else gff_is_fwd
-
-    search_start = max(0, gff_start - extension - 1)
-    search_end = min(chrom_len, gff_end + extension)
-    if search_start >= search_end:
-        return [0.0] * n_bins
-
-    events: List[Tuple[int, int]] = []
-    for read in bam.fetch(chrom, search_start, search_end):
-        if read.is_unmapped:
-            continue
-        is_rev = read.is_reverse
-        if want_reverse is not None and is_rev != want_reverse:
-            continue
-
-        r_start = read.reference_start + 1
-        r_end = read.reference_end
-        if r_end is None:
-            continue
-
-        if is_rev:
-            r_start -= extension
+            while n <nBins:
+                n+=1
+                binKeys = [x for x in keys if i < x < i+binSize]
+                binDen = float(sum([senseHash[x]+antiHash[x] for x in binKeys]))/binSize
+                clusterLine+=[round(binDen/MMR,4)]
+                i = i+binSize
         else:
-            r_end += extension
+            i = gffLocus.end()
+            while n < nBins:
+                n+=1
+                binKeys = [x for x in keys if i-binSize < x < i]
+                binDen = float(sum([senseHash[x]+antiHash[x] for x in binKeys]))/binSize
+                clusterLine+=[round(binDen/MMR,4)]
+                i = i-binSize
+        newGFF.append(clusterLine)
+        
+            
+    return newGFF
+        
+                
+                
+#=====================================================================
+#============================MAIN METHOD==============================
+#=====================================================================
+        
 
-        ov_s = r_start if r_start > gff_start else gff_start
-        ov_e = r_end if r_end < gff_end else gff_end
-        if ov_s <= ov_e:
-            events.append((ov_s, 1))
-            events.append((ov_e + 1, -1))
-
-    if not events:
-        return [0.0] * n_bins
-
-    events.sort()
-
-    intervals: List[Tuple[int, int, int]] = []
-    depth = 0
-    prev_pos: Optional[int] = None
-    idx = 0
-    n_ev = len(events)
-
-    while idx < n_ev:
-        pos = events[idx][0]
-        if prev_pos is not None and depth > floor and pos > prev_pos:
-            intervals.append((prev_pos, pos - 1, depth))
-        while idx < n_ev and events[idx][0] == pos:
-            depth += events[idx][1]
-            idx += 1
-        prev_pos = pos
-
-    if n_bins == 1:
-        total_cov = sum((iv_e - iv_s + 1) * d for iv_s, iv_e, d in intervals)
-        return [round((total_cov / bin_size) / mmr, 4)]
-
-    bin_bounds: List[Tuple[int, int]] = []
-    if gff_strand in ("+", ".", "both"):
-        cur = float(gff_start)
-        for _ in range(n_bins):
-            nxt = cur + bin_size
-            bin_bounds.append((int(cur), int(nxt)))
-            cur = nxt
-        reverse_bins = False
-    else:
-        cur = float(gff_end)
-        for _ in range(n_bins):
-            prv = cur - bin_size
-            bin_bounds.append((int(prv), int(cur)))
-            cur = prv
-        bin_bounds.reverse()
-        reverse_bins = True
-
-    bin_covs = [0] * n_bins
-    inv_bin_size = 1.0 / bin_size
-
-    for iv_s, iv_e, d in intervals:
-        b0 = max(0, int((iv_s - gff_start) * inv_bin_size) - 1)
-        b1 = min(n_bins - 1, int((iv_e - gff_start) * inv_bin_size) + 1)
-        for b in range(b0, b1 + 1):
-            bs, be = bin_bounds[b]
-            s = iv_s if iv_s > bs else bs
-            e = iv_e if iv_e < be else be
-            if s <= e:
-                bin_covs[b] += (e - s + 1) * d
-
-    if reverse_bins:
-        bin_covs.reverse()
-
-    denom = bin_size * mmr
-    return [round(cov / denom, 4) for cov in bin_covs]
+def main():
+    from optparse import OptionParser
+    usage = "usage: %prog [options] -b [SORTED BAMFILE] -i [INPUTFILE] -o [OUTPUTFILE]"
+    parser = OptionParser(usage = usage)
+    #required flags
+    parser.add_option("-b","--bam", dest="bam",nargs = 1, default=None,
+                      help = "Enter .bam file to be processed.")
+    parser.add_option("-i","--input", dest="input",nargs = 1, default=None,
+                      help = "Enter .gff or ENRICHED REGION file to be processed.")
+    #output flag
+    parser.add_option("-o","--output", dest="output",nargs = 1, default=None,
+                      help = "Enter the output filename.")
+    #additional options
+    parser.add_option("-s","--sense", dest="sense",nargs = 1, default='both',
+                      help = "Map to '+','-' or 'both' strands. Default maps to both.")
 
 
-def _process_chunk(
-    args: Tuple[str, List[List[str]], str, int, int, int, float]
-) -> List[List[Any]]:
-    bam_file, gff_chunk, sense, extension, floor, n_bins, mmr = args
-    results: List[List[Any]] = []
-
-    with pysam.AlignmentFile(bam_file, "rb") as bam:
-        ref_lengths = dict(zip(bam.references, bam.lengths))
-
-        for line in gff_chunk:
-            orig_chrom = line[0]
-            gff_id = line[1]
-            gff_start = int(line[3])
-            gff_end = int(line[4])
-            gff_strand = line[6]
-
-            # Preserve original GFF chromosome name so ROSE_main.py mapCollection matches 100%
-            locus_str = f"{orig_chrom}({gff_strand}):{gff_start}-{gff_end}"
-            cluster_line: List[Any] = [gff_id, locus_str]
-
-            if n_bins > 0:
-                bin_size = (gff_end - gff_start) / n_bins
-                bam_chrom = _resolve_bam_chrom(orig_chrom, ref_lengths)
-
-                if bin_size <= 0:
-                    cluster_line.extend(["NA"] * n_bins)
-                elif bam_chrom is None:
-                    cluster_line.extend([0.0] * n_bins)
-                elif floor > 0:
-                    cluster_line.extend(
-                        _compute_bins_with_floor(
-                            bam, bam_chrom, ref_lengths[bam_chrom],
-                            gff_start, gff_end, gff_strand,
-                            sense, extension, floor, n_bins, bin_size, mmr,
-                        )
-                    )
-                else:
-                    cluster_line.extend(
-                        _compute_bins_floor0(
-                            bam, bam_chrom, ref_lengths[bam_chrom],
-                            gff_start, gff_end, gff_strand,
-                            sense, extension, n_bins, bin_size, mmr,
-                        )
-                    )
-
-            results.append(cluster_line)
-
-    return results
+    parser.add_option("-f","--floor", dest="floor",nargs =1, default=0,
+                      help = "Sets a read floor threshold necessary to count towards density")    
+    parser.add_option("-e","--extension", dest="extension",nargs = 1, default=200,
+                      help = "Extends reads by n bp. Default value is 200bp")
+    parser.add_option("-r","--rpm", dest="rpm",action = 'store_true', default=False,
+                      help = "Normalizes density to reads per million (rpm)")
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
+    parser.add_option("-m","--matrix", dest="matrix",nargs = 1, default=None,
+                      help = "Outputs a variable bin sized matrix. User must specify number of bins.")
 
-    parser = argparse.ArgumentParser(description="Fast pysam drop-in for ROSE_bamToGFF.py")
-    parser.add_argument("-b", "--bam", required=True, help="Sorted and indexed BAM file")
-    parser.add_argument("-i", "--input", required=True, help="Input .gff file")
-    parser.add_argument("-o", "--output", default=None, help="Output filename")
-    parser.add_argument("-s", "--sense", choices=["+", "-", ".", "both"], default="both")
-    parser.add_argument("-f", "--floor", type=int, default=0)
-    parser.add_argument("-e", "--extension", type=int, default=200)
-    parser.add_argument("-r", "--rpm", action="store_true", default=False)
-    parser.add_argument("-m", "--matrix", type=int, default=None)
-    parser.add_argument("-p", "--threads", type=int, default=None)
+    (options,args) = parser.parse_args()
 
-    args = parser.parse_args(argv)
+    print(options)
+    print(args)
 
-    bam_path = Path(args.bam).resolve()
-    if not bam_path.exists():
-        logger.error(f"BAM file not found: {args.bam}")
-        return 1
+    if options.bam:
+        bamFile = options.bam
+        fullPath = os.path.abspath(bamFile)
+        bamName = fullPath.split('/')[-1].split('.')[0]
+        pathFolder = '/'.join(fullPath.split('/')[0:-1])
+        fileList = os.listdir(pathFolder)
+        hasBai = False
+        for fileName in fileList:
+            if fileName.count(bamName) == 1 and fileName.count('.bai') == 1:
+                hasBai = True
 
-    # Support both .bai and .csi indices
-    has_idx = any(
-        Path(cand).exists()
-        for cand in (
-            f"{bam_path}.bai",
-            f"{bam_path}.csi",
-            str(bam_path.with_suffix(".bai")),
-            str(bam_path.with_suffix(".csi")),
-        )
-    )
-    if not has_idx:
-        logger.error("No .bai or .csi index found for BAM file.")
-        return 1
+        if not hasBai:
+            print('ERROR: no associated .bai file found with bam. Must use a sorted bam with accompanying index file')
+            parser.print_help()
+            exit()
+   
+    if options.sense:
+        if ['+','-','.','both'].count(options.sense) == 0:
+            print('ERROR: sense flag must be followed by +,-,.,both')
+            parser.print_help()
+            exit()
 
-    if not Path(args.input).exists():
-        logger.error(f"Input GFF not found: {args.input}")
-        return 1
 
-    output = args.output or os.path.join(os.getcwd(), Path(args.input).name + ".mapped")
-    n_bins = int(args.matrix) if args.matrix else 0
+    if options.matrix:
+        try:
+            int(options.matrix)
+        except:
+            print('ERROR: User must specify an integer bin number for matrix (try 50)')
+            parser.print_help()
+            exit()
+            
 
-    # Optional escape hatch: set ROSE_IGNORE_FLOOR=1 to match pyrose2 v2.0 floor=0 behavior
-    floor = 0 if os.environ.get("ROSE_IGNORE_FLOOR") == "1" else int(args.floor)
+    
+    
+    if options.input and options.bam:
+        inputFile = options.input
+        gffFile = inputFile
 
-    with pysam.AlignmentFile(str(bam_path), "rb") as bam:
-        mmr = round(float(bam.mapped) / 1_000_000, 4) if args.rpm else 1.0
-
-    gff_rows = _parse_gff(args.input)
-
-    workers = args.threads if args.threads is not None else int(os.environ.get("ROSE_WORKERS", "1"))
-    workers = max(1, min(workers, max(1, len(gff_rows))))
-
-    logger.info(
-        f"[fast-pysam] BAM={bam_path.name} MMR={mmr} regions={len(gff_rows)} "
-        f"floor={floor} ext={args.extension} bins={n_bins} workers={workers}"
-    )
-
-    out_rows: List[List[Any]] = []
-    if n_bins > 0:
-        out_rows.append(
-            ["GENE_ID", "locusLine"] + [f"bin_{n}_{bam_path.name}" for n in range(1, n_bins + 1)]
-        )
-
-    if gff_rows:
-        if workers == 1:
-            out_rows.extend(
-                _process_chunk((str(bam_path), gff_rows, args.sense, args.extension, floor, n_bins, mmr))
-            )
+        bamFile = options.bam
+        
+        if options.output == None:
+            output = os.getcwd() + inputFile.split('/')[-1]+'.mapped'
         else:
-            n_chunks = min(len(gff_rows), workers * 4)
-            chunk_size = (len(gff_rows) + n_chunks - 1) // n_chunks
-            tasks = [
-                (str(bam_path), gff_rows[i : i + chunk_size], args.sense, args.extension, floor, n_bins, mmr)
-                for i in range(0, len(gff_rows), chunk_size)
-            ]
-            with ProcessPoolExecutor(max_workers=workers) as ex:
-                for chunk_res in ex.map(_process_chunk, tasks):
-                    out_rows.extend(chunk_res)
+            output = options.output
+        if options.matrix:
+            print('mapping to GFF and making a matrix with fixed bin number')
 
-    # Atomic write: prevent ROSE_main.py polling loop from reading a half-written file
-    out_path = Path(output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = out_path.with_name(f".{out_path.name}.tmp.{os.getpid()}")
+            newGFF = mapBamToGFF(bamFile,gffFile,options.sense,int(options.extension),options.floor,options.rpm,options.matrix)
 
-    with open(tmp_path, "w") as out_fh:
-        for row in out_rows:
-            out_fh.write("\t".join(map(str, row)) + "\n")
-
-    os.replace(tmp_path, out_path)
-    logger.info(f"[fast-pysam] Done -> {output}")
-    return 0
-
-
+            
+        ROSE_utils.unParseTable(newGFF,output,'\t')
+    else:
+        parser.print_help()
+                
+ 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
