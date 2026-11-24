@@ -4,7 +4,9 @@
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-A fast, modern tool for identifying super-enhancers and their target genes from ChIP-seq data.
+ROSE2：A fast, modern tool for identifying super-enhancers and their target genes from ChIP-seq data.
+
+**Fork of ROSE2. Bug fixes and computation acceleration. Typical runtime: ~5h → ~10min. Preserves original super-enhancer calling logic and output.**
 
 ---
 
