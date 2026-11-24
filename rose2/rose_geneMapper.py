@@ -151,7 +151,7 @@ def map_enhancer_to_gene(
             closest_gene = ""
         else:
             # Calculate enhancer center
-            enhancer_center = (int(line[2]) + int(line[3])) / 2
+            enhancer_center = (int(float(line[2])) + int(float(line[3]))) / 2
 
             # Get absolute distance to enhancer center
             dist_list = [
@@ -228,7 +228,7 @@ def map_enhancer_to_gene(
         gene_to_enhancer_table.append(new_line)
 
     # Re-sort enhancer-to-gene table by signal
-    enhancer_order = utils.order([int(line[-2]) for line in enhancer_to_gene_table[1:]])
+    enhancer_order = utils.order([int(float(line[-2])) for line in enhancer_to_gene_table[1:]])
     sorted_table = [enhancer_to_gene_table[0]]
     for i in enhancer_order:
         sorted_table.append(enhancer_to_gene_table[i + 1])
